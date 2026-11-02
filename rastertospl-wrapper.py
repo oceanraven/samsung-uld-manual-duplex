@@ -10,13 +10,13 @@ It uses libcupsimage to properly parse CUPS Raster data (handling v1, v2, v3
 and PackBits compression natively).
 """
 
+import ctypes
 import os
-import sys
+import re
 import struct
 import subprocess
-import time
-import signal
-import ctypes
+import sys
+import tempfile
 from ctypes.util import find_library
 
 # ---------------------------------------------------------------------------
@@ -37,18 +37,27 @@ if not os.path.isfile(REAL_FILTER):
             REAL_FILTER = candidate
             break
 
-DUPLEX_REQUEST_DIR = "/tmp/manual-duplex"
-DUPLEX_FIFO = os.path.join(DUPLEX_REQUEST_DIR, "request")
-DUPLEX_RESPONSE_FIFO = os.path.join(DUPLEX_REQUEST_DIR, "response")
+DUPLEX_REQUEST_DIR = None
+
+# Native cups_page_header2_t layout (unsigned 32-bit fields).
+HEADER_SIZE = 1796
+DUPLEX_OFFSET = 272
+TUMBLE_OFFSET = 368
+WIDTH_OFFSET = 372
+HEIGHT_OFFSET = 376
+BITS_PER_PIXEL_OFFSET = 388
+BYTES_PER_LINE_OFFSET = 392
+COLOR_ORDER_OFFSET = 396
+COLOR_SPACE_OFFSET = 400
+CHUNK_SIZE = 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Logging helper
 # ---------------------------------------------------------------------------
 
 
-def log(msg):
-    print(f"DEBUG: rastertospl-wrapper: {msg}", file=sys.stderr)
-
+def log(msg, level="DEBUG"):
+    print(f"{level}: rastertospl-wrapper: {msg}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # libcups bindings
@@ -61,27 +70,20 @@ try:
     libcups.cupsRasterOpen.restype = ctypes.c_void_p
     libcups.cupsRasterOpen.argtypes = [ctypes.c_int, ctypes.c_int]
 
+    libcups.cupsRasterClose.restype = None
     libcups.cupsRasterClose.argtypes = [ctypes.c_void_p]
 
     libcups.cupsRasterReadHeader2.restype = ctypes.c_uint
     libcups.cupsRasterReadHeader2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
     libcups.cupsRasterReadPixels.restype = ctypes.c_uint
-    libcups.cupsRasterReadPixels.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint,
-    ]
+    libcups.cupsRasterReadPixels.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 
     libcups.cupsRasterWriteHeader2.restype = ctypes.c_uint
     libcups.cupsRasterWriteHeader2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
     libcups.cupsRasterWritePixels.restype = ctypes.c_uint
-    libcups.cupsRasterWritePixels.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint,
-    ]
+    libcups.cupsRasterWritePixels.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
 except Exception as e:
     log(f"Failed to load libcupsimage: {e}")
     libcups = None
@@ -105,6 +107,12 @@ def parse_options(options_str):
 
 
 def is_manual_duplex_requested(options):
+    # Existing hardware-duplex PPDs must continue to use the vendor filter.
+    ppd_path = os.environ.get("PPD")
+    if ppd_path:
+        with open(ppd_path, "rb") as ppd:
+            if re.search(rb'^\*Duplex\s+[^:]+:\s*"[^"\r\n]+"', ppd.read(), re.MULTILINE):
+                return False
     duplex = options.get("Duplex", "None")
     if duplex in ("DuplexNoTumble", "DuplexTumble"):
         return True
@@ -123,7 +131,6 @@ def get_duplex_mode(options):
         return "short"
     return "long"
 
-
 # ---------------------------------------------------------------------------
 # Raster processing
 # ---------------------------------------------------------------------------
@@ -135,65 +142,116 @@ def parse_raster_stream(fd_in, job_id):
     uncompressed pixels to a temporary file to save memory.
     Returns a list of (header_bytes, tmp_file_path)
     """
-    ras_in = libcups.cupsRasterOpen(fd_in, 0)  # 0 = CUPS_RASTER_READ
+    ras_in = libcups.cupsRasterOpen(fd_in, 0)  # CUPS_RASTER_READ
     if not ras_in:
-        raise Exception("cupsRasterOpen failed")
+        raise OSError("cupsRasterOpen failed")
 
     pages = []
     page_idx = 0
 
-    os.makedirs(DUPLEX_REQUEST_DIR, mode=0o777, exist_ok=True)
+    try:
+        while True:
+            header = ctypes.create_string_buffer(HEADER_SIZE)
+            if not libcups.cupsRasterReadHeader2(ras_in, header):
+                break
 
-    while True:
-        header = ctypes.create_string_buffer(1796)
-        if not libcups.cupsRasterReadHeader2(ras_in, header):
-            break
+            height = struct.unpack_from("I", header, HEIGHT_OFFSET)[0]
+            bpl = struct.unpack_from("I", header, BYTES_PER_LINE_OFFSET)[0]
+            color_order = struct.unpack_from("I", header, COLOR_ORDER_OFFSET)[0]
+            if color_order != 0:
+                raise ValueError("Only chunky raster color order is supported")
+            if not height or not bpl:
+                raise ValueError("Invalid raster dimensions")
+            page_size = height * bpl
 
-        height = struct.unpack_from("I", header, 376)[0]
-        bpl = struct.unpack_from("I", header, 392)[0]
-        page_size = height * bpl
+            log(f"Parsed page {page_idx + 1} header: {height}x{bpl} ({page_size} bytes)")
 
-        log(f"Parsed page {page_idx + 1} header: {height}x{bpl} ({page_size} bytes)")
+            tmp_file = os.path.join(DUPLEX_REQUEST_DIR, f"job-{job_id}-page-{page_idx}.raw")
 
-        tmp_file = os.path.join(DUPLEX_REQUEST_DIR, f"job-{job_id}-page-{page_idx}.raw")
+            # Read in chunks to avoid allocating huge string buffers for very large pages
+            bytes_read = 0
 
-        # Read in chunks to avoid allocating huge string buffers for very large pages
-        chunk_size = 1024 * 1024 * 4  # 4MB
-        bytes_read = 0
+            with open(tmp_file, "wb") as f:
+                while bytes_read < page_size:
+                    to_read = min(CHUNK_SIZE, page_size - bytes_read)
+                    pixel_data = ctypes.create_string_buffer(to_read)
+                    res = libcups.cupsRasterReadPixels(ras_in, pixel_data, to_read)
+                    if res == 0:
+                        raise ValueError("Truncated raster page")
+                    f.write(pixel_data.raw[:res])
+                    bytes_read += res
 
-        with open(tmp_file, "wb") as f:
-            while bytes_read < page_size:
-                to_read = min(chunk_size, page_size - bytes_read)
-                pixel_data = ctypes.create_string_buffer(to_read)
-                res = libcups.cupsRasterReadPixels(ras_in, pixel_data, to_read)
-                if res == 0:
-                    break
-                f.write(pixel_data.raw)
-                bytes_read += to_read
+            pages.append((header.raw, tmp_file))
+            page_idx += 1
 
-        pages.append((header.raw, tmp_file))
-        page_idx += 1
-
-    libcups.cupsRasterClose(ras_in)
+    finally:
+        libcups.cupsRasterClose(ras_in)
     return pages
+
+
+def rotate_page_180(page):
+    """Reverse rows and whole pixels, preserving channel order and row padding."""
+    header, source = page
+    width, height = struct.unpack_from("2I", header, WIDTH_OFFSET)
+    bits, stride = struct.unpack_from("2I", header, BITS_PER_PIXEL_OFFSET)
+    active = (width * bits + 7) // 8
+    if not width or not height or bits <= 0 or active > stride:
+        raise ValueError("Invalid raster geometry for rotation")
+    if bits not in (1, 2, 4) and bits % 8:
+        raise ValueError(f"Unsupported packed pixel size: {bits}")
+    destination = source + ".rotated"
+    table = None
+    if bits < 8:
+        mask = (1 << bits) - 1
+        table = bytes(sum(((value >> offset) & mask) << (8 - bits - offset)
+                          for offset in range(0, 8, bits)) for value in range(256))
+    with open(source, "rb") as inp, open(destination, "wb") as out:
+        for y in range(height - 1, -1, -1):
+            inp.seek(y * stride)
+            row = inp.read(stride)
+            if len(row) != stride:
+                raise ValueError("Truncated raster page during rotation")
+            pixels = row[:active]
+            if bits < 8:
+                reversed_bytes = pixels[::-1].translate(table)
+                padding = active * 8 - width * bits
+                value = int.from_bytes(reversed_bytes, "big") << padding
+                value &= (1 << (active * 8)) - 1
+                value |= pixels[-1] & ((1 << padding) - 1)
+                rotated = value.to_bytes(active, "big")
+            elif bits == 8:
+                rotated = pixels[::-1]
+            else:
+                pixel_bytes = bits // 8
+                rotated = b"".join(pixels[x:x + pixel_bytes]
+                                   for x in range(active - pixel_bytes, -1, -pixel_bytes))
+            out.write(rotated + row[active:])
+    return header, destination
+
+
+def orient_back_pages(pages, mode):
+    # With the tested refeed path, unrotated portrait backs bind at the short edge.
+    oriented = []
+    for page in pages:
+        width, height = struct.unpack_from("2I", page[0], WIDTH_OFFSET)
+        rotate = (mode == "long") == (width <= height)
+        oriented.append(rotate_page_180(page) if rotate else page)
+    return oriented
 
 
 def run_real_filter(argv, pages, is_last_pass, extra_options=None):
     """
     Spawns rastertospl-real and writes the selected pages via a new CUPS raster stream.
     """
-    cmd = [REAL_FILTER] + argv[1:]
+    cmd = [REAL_FILTER] + argv[1:6]
     if len(cmd) >= 6:
         opts = cmd[5]
         cleaned = []
         for token in opts.split():
-            if (
-                token.startswith("Duplex=")
-                or token.startswith("sides=")
-                or token.startswith("InputSlot=")
-            ):
+            if token.startswith(("Duplex=", "sides=", "InputSlot=")):
                 continue
             cleaned.append(token)
+        cleaned.extend(["Duplex=None", "sides=one-sided"])
         if extra_options:
             cleaned.append(extra_options)
         cmd[5] = " ".join(cleaned) if cleaned else "none"
@@ -216,45 +274,47 @@ def run_real_filter(argv, pages, is_last_pass, extra_options=None):
         proc.wait()
         return 1
 
-    for header_bytes, tmp_file in pages:
-        header = ctypes.create_string_buffer(header_bytes, len(header_bytes))
-        libcups.cupsRasterWriteHeader2(ras_out, header)
+    try:
+        for header_bytes, tmp_file in pages:
+            header = ctypes.create_string_buffer(header_bytes, len(header_bytes))
+            # Suppress hardware duplex in the raster header as well as options.
+            struct.pack_into("I", header, DUPLEX_OFFSET, 0)
+            struct.pack_into("I", header, TUMBLE_OFFSET, 0)
+            if not libcups.cupsRasterWriteHeader2(ras_out, header):
+                raise IOError("Failed to write raster header")
 
-        page_size = os.path.getsize(tmp_file)
-        chunk_size = 1024 * 1024 * 4
+            with open(tmp_file, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    pixel_buf = ctypes.create_string_buffer(chunk, len(chunk))
+                    if libcups.cupsRasterWritePixels(ras_out, pixel_buf, len(chunk)) != len(chunk):
+                        raise IOError("Failed to write raster pixels")
 
-        with open(tmp_file, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                pixel_buf = ctypes.create_string_buffer(chunk, len(chunk))
-                libcups.cupsRasterWritePixels(ras_out, pixel_buf, len(chunk))
+            if is_last_pass:
+                try:
+                    os.unlink(tmp_file)
+                except FileNotFoundError:
+                    pass
 
-        if is_last_pass:
-            try:
-                os.unlink(tmp_file)
-            except:
-                pass
-
-    libcups.cupsRasterClose(ras_out)
-    proc.stdin.close()
-    proc.wait()
+    finally:
+        libcups.cupsRasterClose(ras_out)
+        proc.stdin.close()
+        proc.wait()
     return proc.returncode
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
-def main():
+def _main():
     argv = sys.argv
+    if len(argv) not in (6, 7):
+        log("Expected job-id user title copies options [raster-file]", "ERROR")
+        return 1
     log(f"Wrapper invoked with {len(argv)} arguments")
-
-    if libcups is None:
-        log("libcupsimage could not be loaded - falling back to direct passthrough")
-        os.execv(REAL_FILTER, [REAL_FILTER] + argv[1:])
 
     options_str = argv[5] if len(argv) > 5 else ""
     options = parse_options(options_str)
@@ -263,11 +323,16 @@ def main():
         log("No duplex requested - passing through to real filter")
         os.execv(REAL_FILTER, [REAL_FILTER] + argv[1:])
 
+    if libcups is None:
+        log("Manual duplex requires libcupsimage", "ERROR")
+        return 1
+    if len(argv) > 4 and argv[4] != "1":
+        log("Manual duplex requires one copy per job", "ERROR")
+        return 1
+
     log("Manual duplex requested - intercepting raster stream")
 
-    duplex_mode = get_duplex_mode(options)
-    job_id = argv[1] if len(argv) > 1 else "0"
-    title = argv[3] if len(argv) > 3 else "Unknown"
+    job_id = "raster"
 
     fd_in = 0
     if len(argv) > 6 and argv[6]:
@@ -277,9 +342,6 @@ def main():
         pages = parse_raster_stream(fd_in, job_id)
     except Exception as e:
         log(f"Error parsing raster stream: {e}")
-        log("Falling back to direct passthrough")
-        if fd_in != 0:
-            os.close(fd_in)
         return 1
     finally:
         if fd_in != 0:
@@ -298,21 +360,21 @@ def main():
     even_pages = [pages[i] for i in range(1, total_pages, 2)]
 
     if total_pages % 2 != 0:
-        # Total pages is odd. The last odd page has no corresponding even page.
+        # Total pages is odd (2n + 1). The last odd page has no corresponding even page.
         # When the stack is flipped and fed back, this last odd page will be the first
         # sheet pulled. We must pad the even pages with a blank page so that this sheet
         # passes through blank, and the actual even pages align correctly with their fronts.
 
         # We duplicate the header of the last odd page
         last_header = odd_pages[-1][0]
-        height = struct.unpack_from("I", last_header, 376)[0]
-        bpl = struct.unpack_from("I", last_header, 392)[0]
-        cs = struct.unpack_from("I", last_header, 396)[0]
+        height = struct.unpack_from("I", last_header, HEIGHT_OFFSET)[0]
+        bpl = struct.unpack_from("I", last_header, BYTES_PER_LINE_OFFSET)[0]
+        cs = struct.unpack_from("I", last_header, COLOR_SPACE_OFFSET)[0]
 
         # Additive colorspaces (W, RGB, SW, etc) use 0xFF for white.
         # Subtractive (K, CMYK) use 0x00 for white.
-        if cs in (0, 1, 2, 15, 16, 17, 18, 19, 20):
-            fill_byte = b"\xff"
+        if cs in (0, 1, 2, 18, 19, 20):
+            fill_byte = b"\xFF"
         else:
             fill_byte = b"\x00"
 
@@ -330,6 +392,8 @@ def main():
 
         even_pages.append((last_header, blank_file))
 
+    even_pages = orient_back_pages(even_pages, get_duplex_mode(options))
+
     log(f"Odd pages: {len(odd_pages)}, Even pages (padded): {len(even_pages)}")
 
     log("=== Printing odd pages ===")
@@ -342,7 +406,8 @@ def main():
     even_pages_reversed = list(reversed(even_pages))
 
     # We bypass the computer GUI wait and instead use the printer's Manual Feed.
-    # To avoid requiring the user to press OK for every page, we split the even pages into two jobs:
+    # To avoid requiring the user to press OK for *every* page, we split the even
+    # pages into two jobs:
     # 1. The first even page is sent with InputSlot=Manual (Printer pauses, user presses OK)
     # 2. The remaining even pages are sent with InputSlot=Auto (Prints continuously)
 
@@ -367,13 +432,25 @@ def main():
     return 0
 
 
+def main():
+    global DUPLEX_REQUEST_DIR
+    options = parse_options(sys.argv[5] if len(sys.argv) > 5 else "")
+    if not is_manual_duplex_requested(options):
+        return _main()
+    with tempfile.TemporaryDirectory(prefix="manual-duplex-") as directory:
+        previous_directory = DUPLEX_REQUEST_DIR
+        DUPLEX_REQUEST_DIR = directory
+        try:
+            return _main()
+        finally:
+            DUPLEX_REQUEST_DIR = previous_directory
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        log(f"Fatal error: {e}")
+        log(f"Fatal error: {e}", "ERROR")
         import traceback
-
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
